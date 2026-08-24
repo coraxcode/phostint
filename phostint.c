@@ -85,7 +85,7 @@
 #endif
 
 #define APP_NAME "PhosTint"
-#define APP_VERSION "1.2.0"
+#define APP_VERSION "1.2.1"
 #define MAX_SAVED_CRTCS 64
 #define MAX_BACKLIGHTS 32
 #define MAX_COMMAND 512
@@ -1382,6 +1382,7 @@ static int set_preset(ColorState *s, const char *name)
     } else {
         return -1;
     }
+    s->kelvin = 0.0;
     (void)snprintf(s->mode, sizeof(s->mode), "%s", name);
     s->modified = 1;
     return 0;
@@ -1606,6 +1607,7 @@ static int handle_command(App *app, const char *command, char *response, size_t 
         app->state.g = 1.0;
         app->state.b = value / 100.0;
         app->state.strength = 1.0;
+        app->state.kelvin = 0.0;
         app->state.modified = 1;
         (void)snprintf(app->state.mode, sizeof(app->state.mode), "%s", "blue-control");
         if (apply_color_state(app) != 0) {
@@ -1631,6 +1633,7 @@ static int handle_command(App *app, const char *command, char *response, size_t 
         app->state.g = g;
         app->state.b = b;
         app->state.strength = strength / 100.0;
+        app->state.kelvin = 0.0;
         app->state.modified = 1;
         (void)snprintf(app->state.mode, sizeof(app->state.mode), "%s", "custom-color");
         if (apply_color_state(app) != 0) {
@@ -1652,10 +1655,16 @@ static int handle_command(App *app, const char *command, char *response, size_t 
             (void)snprintf(response, response_size, "Optional RGB strength must be 0..100 percent.");
             return -1;
         }
+        if (r < 1.0 && g < 1.0 && b < 1.0) {
+            (void)snprintf(response, response_size,
+                           "At least one RGB channel must stay at 1%% or higher so the screen remains visible.");
+            return -1;
+        }
         app->state.r = r / 100.0;
         app->state.g = g / 100.0;
         app->state.b = b / 100.0;
         app->state.strength = strength / 100.0;
+        app->state.kelvin = 0.0;
         app->state.modified = 1;
         (void)snprintf(app->state.mode, sizeof(app->state.mode), "%s", "custom-rgb");
         if (apply_color_state(app) != 0) {
@@ -2216,10 +2225,12 @@ enum {
 
 typedef enum {
     ROW_TEMP = 0,
-    ROW_BLUE_LIMIT,
+    ROW_RED,
+    ROW_GREEN,
     ROW_BLUE,
-    ROW_BRIGHT,
     ROW_STRENGTH,
+    ROW_BLUE_LIMIT,
+    ROW_BRIGHT,
     ROW_NOISE,
     ROW_BACKLIGHT,
     ROW_COUNT
@@ -2227,8 +2238,10 @@ typedef enum {
 
 typedef struct {
     double kelvin;
+    double red;         /* R/G/B rows hold EFFECTIVE channel percentages:  */
+    double green;       /* ((1-s) + s*c) * 100 - exactly what the display  */
+    double blue;        /* receives, so edits never cause a visual jump.   */
     double blue_limit;
-    double blue;
     double brightness;
     double strength;
     double noise;
@@ -2247,10 +2260,12 @@ static const struct {
     double min, max, step, big;
 } TUI_ROWS[ROW_COUNT] = {
     { "Temperature (K)",   1000.0, 10000.0, 100.0, 500.0 },
-    { "Blue limit",           0.0,   100.0,   5.0,  20.0 },
+    { "Red channel",          0.0,   100.0,   5.0,  20.0 },
+    { "Green channel",        0.0,   100.0,   5.0,  20.0 },
     { "Blue channel",         0.0,   100.0,   5.0,  20.0 },
-    { "Brightness (soft)",    1.0,   100.0,   5.0,  20.0 },
     { "Tint strength",        0.0,   100.0,   5.0,  20.0 },
+    { "Blue limit",           0.0,   100.0,   5.0,  20.0 },
+    { "Brightness (soft)",    1.0,   100.0,   5.0,  20.0 },
     { "Noise",                0.0,   100.0,   5.0,  20.0 },
     { "Backlight (hw)",       1.0,   100.0,   5.0,  20.0 },
 };
@@ -2330,30 +2345,42 @@ static int tui_read_key(void)
     if (n < 0) return errno == EINTR ? TKEY_NONE : -1;
     if (c != 0x1bU) return (int)c;
 
+    /*
+     * Consume the WHOLE escape sequence up to its final byte (0x40..0x7E for
+     * CSI). Partial parsing would leak modifier parameters ("ESC[1;5C" for
+     * Ctrl+Right) back into the key stream, where the '5' would fire a
+     * preset out of nowhere.
+     */
     {
         struct pollfd p;
-        unsigned char seq0 = 0U, seq1 = 0U, seq2 = 0U;
+        unsigned char b0 = 0U;
+        unsigned char fin = 0U;
+        unsigned char first_param = 0U;
 
         p.fd = STDIN_FILENO;
         p.events = POLLIN;
         p.revents = 0;
         if (poll(&p, 1U, 50) <= 0) return TKEY_NONE; /* lone ESC: ignore */
-        if (read(STDIN_FILENO, &seq0, 1U) != 1) return TKEY_NONE;
-        if (seq0 != '[' && seq0 != 'O') return TKEY_NONE;
-        if (read(STDIN_FILENO, &seq1, 1U) != 1) return TKEY_NONE;
-        switch (seq1) {
-        case 'A': return TKEY_UP;
-        case 'B': return TKEY_DOWN;
-        case 'C': return TKEY_RIGHT;
-        case 'D': return TKEY_LEFT;
-        case '5':
-        case '6':
-            if (read(STDIN_FILENO, &seq2, 1U) != 1) return TKEY_NONE;
-            (void)seq2;
-            return seq1 == '5' ? TKEY_PGUP : TKEY_PGDN;
-        default:
-            return TKEY_NONE;
+        if (read(STDIN_FILENO, &b0, 1U) != 1) return TKEY_NONE;
+        if (b0 != '[' && b0 != 'O') return TKEY_NONE;
+        for (;;) {
+            unsigned char cb = 0U;
+            p.revents = 0;
+            if (poll(&p, 1U, 50) <= 0) return TKEY_NONE;
+            if (read(STDIN_FILENO, &cb, 1U) != 1) return TKEY_NONE;
+            if (cb >= 0x40U && cb <= 0x7eU) {
+                fin = cb;
+                break;
+            }
+            if (first_param == 0U) first_param = cb;
         }
+        if (fin == 'A') return TKEY_UP;
+        if (fin == 'B') return TKEY_DOWN;
+        if (fin == 'C') return TKEY_RIGHT;
+        if (fin == 'D') return TKEY_LEFT;
+        if (fin == '~' && first_param == '5') return TKEY_PGUP;
+        if (fin == '~' && first_param == '6') return TKEY_PGDN;
+        return TKEY_NONE; /* anything else (Home, Del, F-keys...) is ignored whole */
     }
 }
 
@@ -2391,13 +2418,14 @@ static int tui_fetch(const char *socket_path, TuiVals *v)
     const char *p;
     char *end = NULL;
     double k = 0.0;
+    double raw_r = 100.0, raw_g = 100.0, raw_b = 100.0;
+    double s;
 
     if (send_daemon_command(socket_path, "status", resp, sizeof(resp)) != 0) return -1;
     if (strncmp(resp, "OK ", 3U) != 0) return -1;
 
     v->kelvin = 6500.0;
     v->blue_limit = 100.0;
-    v->blue = 100.0;
     v->brightness = 100.0;
     v->strength = 100.0;
     v->noise = 0.0;
@@ -2413,19 +2441,27 @@ static int tui_fetch(const char *socket_path, TuiVals *v)
 
     p = strstr(resp, "rgb=");
     if (p != NULL) {
+        double t;
         p += 4;
-        (void)strtod(p, &end);
+        t = strtod(p, &end);
         if (end != p && *end == '/') {
+            raw_r = t;
             p = end + 1;
-            (void)strtod(p, &end);
+            t = strtod(p, &end);
             if (end != p && *end == '/') {
-                double b;
+                raw_g = t;
                 p = end + 1;
-                b = strtod(p, &end);
-                if (end != p) v->blue = b;
+                t = strtod(p, &end);
+                if (end != p) raw_b = t;
             }
         }
     }
+    /* Convert state channels to the EFFECTIVE percentages the display gets:
+     * eff = (1 - strength) + strength * channel. */
+    s = clamp_double(v->strength / 100.0, 0.0, 1.0);
+    v->red = ((1.0 - s) + s * clamp_double(raw_r / 100.0, 0.0, 1.0)) * 100.0;
+    v->green = ((1.0 - s) + s * clamp_double(raw_g / 100.0, 0.0, 1.0)) * 100.0;
+    v->blue = ((1.0 - s) + s * clamp_double(raw_b / 100.0, 0.0, 1.0)) * 100.0;
     return 0;
 }
 
@@ -2433,24 +2469,39 @@ static double tui_row_value(const TuiVals *v, int row)
 {
     switch (row) {
     case ROW_TEMP: return v->kelvin;
-    case ROW_BLUE_LIMIT: return v->blue_limit;
+    case ROW_RED: return v->red;
+    case ROW_GREEN: return v->green;
     case ROW_BLUE: return v->blue;
-    case ROW_BRIGHT: return v->brightness;
     case ROW_STRENGTH: return v->strength;
+    case ROW_BLUE_LIMIT: return v->blue_limit;
+    case ROW_BRIGHT: return v->brightness;
     case ROW_NOISE: return v->noise;
     case ROW_BACKLIGHT: return v->backlight;
     default: return 0.0;
     }
 }
 
-static void tui_row_command(int row, double value, char *cmd, size_t size)
+/*
+ * Editing an R/G/B row sends the full effective triple at 100% strength:
+ * the two untouched channels keep their exact on-screen values, so the only
+ * visible change is the channel the user is moving.
+ */
+static void tui_row_command(const TuiVals *v, int row, double value, char *cmd, size_t size)
 {
     switch (row) {
     case ROW_TEMP: (void)snprintf(cmd, size, "temp %.0f", value); break;
-    case ROW_BLUE_LIMIT: (void)snprintf(cmd, size, "blue-limit %.0f", value); break;
-    case ROW_BLUE: (void)snprintf(cmd, size, "blue %.0f", value); break;
-    case ROW_BRIGHT: (void)snprintf(cmd, size, "brightness %.0f", value); break;
+    case ROW_RED:
+        (void)snprintf(cmd, size, "rgb %.0f %.0f %.0f 100", value, v->green, v->blue);
+        break;
+    case ROW_GREEN:
+        (void)snprintf(cmd, size, "rgb %.0f %.0f %.0f 100", v->red, value, v->blue);
+        break;
+    case ROW_BLUE:
+        (void)snprintf(cmd, size, "rgb %.0f %.0f %.0f 100", v->red, v->green, value);
+        break;
     case ROW_STRENGTH: (void)snprintf(cmd, size, "strength %.0f", value); break;
+    case ROW_BLUE_LIMIT: (void)snprintf(cmd, size, "blue-limit %.0f", value); break;
+    case ROW_BRIGHT: (void)snprintf(cmd, size, "brightness %.0f", value); break;
     case ROW_NOISE: (void)snprintf(cmd, size, "noise %.0f", value); break;
     case ROW_BACKLIGHT: (void)snprintf(cmd, size, "backlight %.0f", value); break;
     default: if (size > 0U) cmd[0] = '\0'; break;
@@ -2463,8 +2514,13 @@ static void tui_send(const char *socket_path, const char *cmd, char *msg, size_t
     const char *p;
 
     if (send_daemon_command(socket_path, cmd, resp, sizeof(resp)) != 0) {
-        (void)snprintf(msg, msg_size, "%s", "Could not reach the daemon.");
-        return;
+        /* The daemon may have been stopped externally: restart it once. */
+        char err[256];
+        if (start_daemon(socket_path, err, sizeof(err)) != 0 ||
+            send_daemon_command(socket_path, cmd, resp, sizeof(resp)) != 0) {
+            (void)snprintf(msg, msg_size, "%s", "Could not reach the daemon.");
+            return;
+        }
     }
     p = resp;
     if (strncmp(p, "OK ", 3U) == 0) p += 3;
@@ -2593,7 +2649,7 @@ static int run_tui(const char *socket_path)
         return EXIT_RUNTIME;
     }
     (void)snprintf(msg, sizeof(msg), "%s",
-                   "Every adjustment applies instantly. 'q' leaves the look active.");
+                   "R/G/B rows are the live per-channel percentages. 'q' keeps the look.");
 
     for (;;) {
         int bl_available = vals.backlight >= 0.0 ? 1 : 0;
@@ -2628,7 +2684,7 @@ static int run_tui(const char *socket_path)
             double nv = clamp_double(tui_row_value(&vals, r2) + dir * step,
                                      TUI_ROWS[r2].min, TUI_ROWS[r2].max);
             char cmd[64];
-            tui_row_command(r2, nv, cmd, sizeof(cmd));
+            tui_row_command(&vals, r2, nv, cmd, sizeof(cmd));
             tui_send(socket_path, cmd, msg, sizeof(msg));
             (void)tui_fetch(socket_path, &vals);
         } else if (key >= '0' && key <= '9') {
