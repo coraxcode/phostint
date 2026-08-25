@@ -38,6 +38,16 @@ LIBS="-lX11 -lXrandr -lXext"
 if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists x11 xrandr xext 2>/dev/null; then
     CFLAGS="$(pkg-config --cflags x11 xrandr xext)"
     LIBS="$(pkg-config --libs x11 xrandr xext)"
+
+    # Optional: XRender answers "does this visual have alpha?" authoritatively.
+    # Without it a mask heuristic is used, so the build never depends on it.
+    if pkg-config --exists xrender 2>/dev/null; then
+        CFLAGS="$CFLAGS $(pkg-config --cflags xrender) -DHAVE_XRENDER"
+        LIBS="$LIBS $(pkg-config --libs xrender)"
+        echo "Optional dependency found: xrender (exact ARGB visual detection)."
+    else
+        echo "Optional dependency missing: xrender (using the ARGB mask heuristic)."
+    fi
 fi
 
 # Hardening flags are probed one by one: each is used only when the local
