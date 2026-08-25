@@ -202,7 +202,18 @@ bindsym $mod+d mode "$display_mode"
   Only devices PhosTint actually changed are recorded, the "original" level is
   re-read immediately before the first change (so another tool's adjustment is
   not undone), and a device whose `max_brightness` changed is left alone
-  because the stored raw level would no longer mean the same thing.
+  because the stored raw level would no longer mean the same thing. A level
+  still owed by a crashed instance outranks the current one: it is the value
+  from before PhosTint ever touched that device, and it survives you moving
+  the brightness by hand in the meantime.
+- The journal is sized to hold everything the program can hold at once — every
+  managed output plus every ramp owed to a disconnected monitor. If recovery
+  data still could not be written in full, the write **fails** rather than
+  silently producing a safety net with a hole in it, and every caller then
+  declines to touch the hardware.
+- A failed RandR enumeration is never mistaken for "no monitors are on". That
+  distinction is what stops `normal` from reporting a clean restore while the
+  screen is still tinted.
 - Applying a look to several monitors is a transaction: every ramp is built
   and validated first, the batch is committed together, and if the X server
   rejects any part of it the whole batch is rolled back — to the look you had
@@ -212,10 +223,17 @@ bindsym $mod+d mode "$display_mode"
 - An output that appears between the last journal write and an apply is
   journalled before anything is painted on it, so a crash can never turn a
   tint into the new "original".
-- If the journal exists but cannot be parsed, it is **kept** (renamed
-  `.corrupt`) rather than deleted, and `status` grows a permanent
-  `attention="..."` note: in that one case the captured baseline may already
-  be tinted and only you can decide to force a neutral ramp.
+- If the journal exists but cannot be read or parsed, the daemon **refuses to
+  start**. That is the one case where it cannot know whether the ramps on
+  screen are pristine or already tinted, and guessing would silently make a
+  tint permanent. The file is kept (renamed `.corrupt`), and you choose:
+  `phostint emergency-reset --identity` for a neutral baseline, or
+  `phostint start --accept-current` to accept what is on screen. A journal
+  that merely does not exist is *not* this case — "unreadable" and "absent"
+  are distinguished, including permission errors and symlink substitution.
+- An over-long control command is rejected outright, never executed
+  truncated: `brightness 100000…` cut short would otherwise become a valid,
+  completely different command.
 - `emergency-reset` tries, in order: a running daemon (via socket, 10 s
   timeout), then the journal (gamma **and** backlight). It works even when X
   is unreachable (backlight-only recovery). If neither is usable it stops and
@@ -257,7 +275,7 @@ never redirect writes elsewhere.
 
 Being precise about this matters more than claiming universal support.
 
-**Automatically verified on every build** — `./phostint selftest` runs 103
+**Automatically verified on every build** — `./phostint selftest` runs 113
 hardware-free checks: the Kelvin curve and its monotonicity; hex/number
 parsing and rejection; the noise generator (determinism, premultiplied alpha,
 golden-ratio density); the command table's arity rules; the monitor-identity
@@ -272,12 +290,18 @@ the colour-factor math; and the poll/scheduling helpers.
 
 **Verified on real hardware**: Intel (i915, `intel_backlight`, eDP-1,
 1024-entry gamma ramps), Xorg 21 with i3wm, single monitor, with and without
-picom. AddressSanitizer + UndefinedBehaviorSanitizer + LeakSanitizer report
-nothing across the full daemon lifecycle, crash recovery, malformed clients
-and TUI sessions. The TUI layout is checked at 108 terminal geometries from
-16x3 to 200x40 — no line ever exceeds the window. Carrying a pristine ramp
-forward for a disconnected monitor is verified with a synthetic journal
-containing an absent display.
+picom.
+
+Stress-tested clean, both natively and under AddressSanitizer +
+UndefinedBehaviorSanitizer + LeakSanitizer, with **zero sanitizer findings**:
+520 sequential commands, 85 concurrent clients, 300 random/malformed command
+lines, 140 hostile socket sessions (raw binary payloads, over-long commands,
+truncated writes, connect-and-abort), plus the full command surface. The
+daemon stayed responsive throughout and exited cleanly every time. The TUI
+layout is checked at 108 terminal geometries from 16x3 to 200x40 — no line
+ever exceeds the window. Carrying a pristine ramp forward for a disconnected
+monitor is verified with a synthetic journal containing an absent display, and
+the corrupt-journal refusal is verified end to end.
 
 **Not verified by the author** (the code is written for it, but no hardware
 was available): AMD and NVIDIA drivers, multi-monitor and multi-GPU setups,
