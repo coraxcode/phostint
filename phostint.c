@@ -15,8 +15,10 @@
  *     backlight device could not be restored.
  *   - SIGINT/SIGTERM/SIGHUP/SIGQUIT trigger restoration before exit.
  *   - If the X server dies, changed backlight values are still restored.
- *   - "emergency-reset" first tries a live daemon, then the recovery file;
- *     if neither is usable it falls back to an identity gamma ramp.
+ *   - "emergency-reset" first tries a live daemon, then the recovery journal.
+ *     If neither is usable it stops and explains: forcing a neutral ramp on
+ *     every connected monitor would also discard an ICC calibration loaded by
+ *     another tool, so it requires an explicit "--identity".
  *   - A per-display file lock guarantees a single daemon instance.
  *   - RandR events are monitored: monitor hotplug and mode changes re-sync
  *     the captured state and re-apply the current look automatically.
@@ -97,9 +99,17 @@
 #endif
 
 #define APP_NAME "PhosTint"
-#define APP_VERSION "1.5.0"
+#define APP_VERSION "1.5.1"
 #define MAX_SAVED_CRTCS 64
 #define MAX_BACKLIGHTS 32
+/*
+ * The journal must be able to hold everything the program can hold at once:
+ * every managed output plus every ramp still owed to a disconnected monitor.
+ * Sizing it to the sum is what makes "never drop recovery data" achievable
+ * instead of merely aspirational.
+ */
+#define MAX_JOURNAL_RAMPS (MAX_SAVED_CRTCS * 2)
+#define MAX_JOURNAL_BACKLIGHTS (MAX_BACKLIGHTS * 2)
 #define MAX_COMMAND 512
 #define MAX_RESPONSE 2048
 #define MAX_CLIENTS 8
@@ -202,7 +212,7 @@ typedef struct {
 } NoiseOverlay;
 
 /*
- * Recovery journal, format 3.
+ * Recovery journal, format 4.
  *
  * boot_hash ties the file to one boot: the /tmp fallback directory survives
  * reboots, and replaying ramps captured before a reboot would be wrong.
@@ -261,10 +271,10 @@ typedef struct {
 } RecoveryResult;
 
 typedef struct {
-    StateRamp ramps[MAX_SAVED_CRTCS];
+    StateRamp ramps[MAX_JOURNAL_RAMPS];
     size_t ramp_count;
-    StateBacklight backlights[MAX_BACKLIGHTS];
-    int backlight_applied[MAX_BACKLIGHTS];
+    StateBacklight backlights[MAX_JOURNAL_BACKLIGHTS];
+    int backlight_applied[MAX_JOURNAL_BACKLIGHTS];
     size_t backlight_count;
 } StateFile;
 
@@ -294,6 +304,12 @@ typedef struct {
      * re-applied the moment that monitor comes back, so an unclean exit with
      * an unplugged monitor never loses its pristine capture.
      */
+    /*
+     * Bumped by every change to the managed-output table. Comparing counts is
+     * not enough: swapping one monitor for another leaves the count identical
+     * while the pristine ramps behind it are completely different.
+     */
+    unsigned long table_generation;
     StateRamp pending[MAX_SAVED_CRTCS];
     size_t pending_count;
     /*
@@ -617,13 +633,6 @@ static int make_runtime_paths_ex(char *socket_path, size_t socket_size,
     return 0;
 }
 
-static int make_runtime_paths(char *socket_path, size_t socket_size,
-                              char *recovery_path, size_t recovery_size,
-                              char *lock_path, size_t lock_size)
-{
-    return make_runtime_paths_ex(socket_path, socket_size, recovery_path, recovery_size,
-                                 lock_path, lock_size, NULL);
-}
 
 static int read_long_file(const char *path, long *value)
 {
@@ -1125,6 +1134,7 @@ static SavedCrtc *find_saved_crtc(App *app, RRCrtc id, size_t *index_out)
 static void remove_saved_crtc(App *app, size_t index)
 {
     if (index >= app->crtc_count) return;
+    app->table_generation++;
     if (app->crtcs[index].original != NULL) {
         XRRFreeGamma(app->crtcs[index].original);
     }
@@ -1219,7 +1229,8 @@ static void crtc_identity(Display *dpy, XRRScreenResources *res,
                           const XRRCrtcInfo *info, RRCrtc id,
                           char *out, size_t size, uint64_t *edid_out)
 {
-    uint64_t combined = 0U;
+    uint64_t hashes[16];
+    size_t nhash = 0U;
     int i;
 
     out[0] = '\0';
@@ -1236,15 +1247,29 @@ static void crtc_identity(Display *dpy, XRRScreenResources *res,
                 }
                 XRRFreeOutputInfo(oi);
             }
-            if (h != 0U) {
-                /* Order-independent fold, so the same set of monitors hashes
-                 * the same however RandR happens to enumerate them. */
-                combined ^= h;
-            }
+            if (h != 0U && nhash < sizeof(hashes) / sizeof(hashes[0])) hashes[nhash++] = h;
         }
     }
     if (out[0] == '\0') (void)snprintf(out, size, "crtc-%lu", (unsigned long)id);
-    if (edid_out != NULL) *edid_out = combined;
+
+    if (edid_out != NULL && nhash > 0U) {
+        /*
+         * Sort, then hash the sorted list: order-independent like XOR, but
+         * without its fatal flaw - two identical monitors cloned on one CRTC
+         * would XOR to exactly zero, i.e. "no identity at all".
+         */
+        size_t a, b;
+        for (a = 1U; a < nhash; ++a) {
+            uint64_t key = hashes[a];
+            b = a;
+            while (b > 0U && hashes[b - 1U] > key) {
+                hashes[b] = hashes[b - 1U];
+                b--;
+            }
+            hashes[b] = key;
+        }
+        *edid_out = fnv1a64(hashes, nhash * sizeof(hashes[0]));
+    }
 }
 
 /*
@@ -1252,15 +1277,21 @@ static void crtc_identity(Display *dpy, XRRScreenResources *res,
  * size, in one pass. Every routine that touches the hardware works from this
  * snapshot, so the whole program shares one consistent view of the topology.
  */
-static size_t enumerate_live_outputs(Display *dpy, Window root,
-                                     LiveOutput *out, size_t max_out)
+static int enumerate_live_outputs(Display *dpy, Window root,
+                                  LiveOutput *out, size_t max_out)
 {
     XRRScreenResources *res;
     size_t n = 0U;
     int c;
 
+    /*
+     * Returns -1 when the topology could not be read at all. That must never
+     * be reported as "zero active outputs": every caller then correctly
+     * concludes there is nothing to restore and would declare success while
+     * the screen is still tinted.
+     */
     res = XRRGetScreenResourcesCurrent(dpy, root);
-    if (res == NULL) return 0U;
+    if (res == NULL) return -1;
     for (c = 0; c < res->ncrtc && n < max_out; ++c) {
         XRRCrtcInfo *info = XRRGetCrtcInfo(dpy, res, res->crtcs[c]);
         int size;
@@ -1285,7 +1316,7 @@ static size_t enumerate_live_outputs(Display *dpy, Window root,
         n++;
     }
     XRRFreeScreenResources(res);
-    return n;
+    return (int)n;
 }
 
 static const LiveOutput *live_find_crtc(const LiveOutput *live, size_t n, RRCrtc crtc)
@@ -1389,9 +1420,12 @@ static int crtc_table_sync(App *app)
     XRRScreenResources *res;
     size_t nlive;
     size_t i, l;
+    int nlive_signed;
     int managed = 0;
 
-    nlive = enumerate_live_outputs(app->dpy, app->root, live, MAX_SAVED_CRTCS);
+    nlive_signed = enumerate_live_outputs(app->dpy, app->root, live, MAX_SAVED_CRTCS);
+    if (nlive_signed < 0) return -1;
+    nlive = (size_t)nlive_signed;
 
     /* Drop entries whose CRTC the server no longer advertises at all. */
     res = XRRGetScreenResourcesCurrent(app->dpy, app->root);
@@ -1436,6 +1470,17 @@ static int crtc_table_sync(App *app)
         if (plan == CRTC_KEEP) {
             saved->active = 1;
             saved->edid_hash = lo->edid_hash;
+            /*
+             * KEEP also covers "same panel, different port": the EDID proves
+             * identity even though the connector changed. The stored name has
+             * to follow, or status, 'output NAME ...' targeting and the
+             * journal would all keep referring to a socket this monitor left.
+             * A changed identity is a journal-worthy event.
+             */
+            if (strcmp(saved->output, lo->name) != 0) {
+                (void)snprintf(saved->output, sizeof(saved->output), "%s", lo->name);
+                app->table_generation++;
+            }
             managed++;
             continue;
         }
@@ -1456,6 +1501,7 @@ static int crtc_table_sync(App *app)
             moved.active = 1;
             (void)snprintf(moved.output, sizeof(moved.output), "%s", lo->name);
             app->crtcs[app->crtc_count++] = moved;
+            app->table_generation++;
             managed++;
             continue;
         }
@@ -1487,6 +1533,7 @@ static int crtc_table_sync(App *app)
                 app->crtcs[app->crtc_count].original = gamma;
                 app->crtcs[app->crtc_count].state = app->state;
                 app->crtc_count++;
+                app->table_generation++;
                 pending_remove(app, (size_t)pending);
                 managed++;
                 continue;
@@ -1508,6 +1555,7 @@ static int crtc_table_sync(App *app)
         app->crtcs[app->crtc_count].original = gamma;
         app->crtcs[app->crtc_count].state = app->state;
         app->crtc_count++;
+        app->table_generation++;
         managed++;
     }
 
@@ -1589,6 +1637,7 @@ static int save_recovery_file(const App *app)
     FILE *fp;
     StateHeader header;
     uint32_t bl_count = 0U;
+    uint32_t bl_dropped = 0U;
     uint32_t written;
     size_t ramp_count;
     size_t pending_written;
@@ -1630,14 +1679,28 @@ static int save_recovery_file(const App *app)
         if (find_backlight_changed(app, app->pending_bl[i].name)) continue;
         bl_count++;
     }
-    if (bl_count > MAX_BACKLIGHTS) bl_count = MAX_BACKLIGHTS;
+    if (bl_count > MAX_JOURNAL_BACKLIGHTS) {
+        bl_dropped = bl_count - MAX_JOURNAL_BACKLIGHTS;
+        bl_count = MAX_JOURNAL_BACKLIGHTS;
+    }
 
     /* The loader refuses a count above the limit, so the writer must never
      * produce one: drop the oldest pending ramps rather than emit a journal
      * this program would later reject. */
     ramp_count = app->crtc_count + app->pending_count;
-    if (ramp_count > MAX_SAVED_CRTCS) ramp_count = MAX_SAVED_CRTCS;
-    pending_written = ramp_count > app->crtc_count ? ramp_count - app->crtc_count : 0U;
+    pending_written = app->pending_count;
+    if (ramp_count > MAX_JOURNAL_RAMPS || bl_dropped > 0U) {
+        /*
+         * Fail closed. Writing a journal that silently omits recovery data
+         * would hand the caller a safety net with a hole in it; every caller
+         * treats a write failure as "do not touch the hardware", which is the
+         * only correct response. The capacity above makes this unreachable in
+         * practice - it exists so the guarantee holds even if it were not.
+         */
+        (void)fclose(fp);
+        (void)unlink(tmp_path);
+        return -1;
+    }
 
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, STATE_MAGIC, sizeof(header.magic));
@@ -1702,14 +1765,24 @@ fail:
  * the current user. Symlinks are rejected so a compromised or shared
  * directory can never redirect the read (nor the trust) elsewhere.
  */
-static FILE *open_state_for_read(const char *path)
+/*
+ * Sets *absent to 1 only when the file genuinely does not exist. Any other
+ * failure - no permission, a symlink where a regular file must be, an I/O
+ * error - means a journal may exist and simply could not be read, which is a
+ * completely different situation from "there is nothing to recover".
+ */
+static FILE *open_state_for_read(const char *path, int *absent)
 {
     int fd;
     struct stat st;
     FILE *fp;
 
+    if (absent != NULL) *absent = 0;
     fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return NULL;
+    if (fd < 0) {
+        if (absent != NULL && errno == ENOENT) *absent = 1;
+        return NULL;
+    }
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
         (void)close(fd);
         return NULL;
@@ -1751,16 +1824,17 @@ static int state_load_ex(const char *path, StateFile *out, int allow_unknown_boo
     StateHeader header;
     uint32_t i;
     char extra;
+    int absent = 0;
 
     memset(out, 0, sizeof(*out));
-    fp = open_state_for_read(path);
-    if (fp == NULL) return 1;
+    fp = open_state_for_read(path, &absent);
+    if (fp == NULL) return absent ? 1 : -1;
 
     if (fread(&header, sizeof(header), 1U, fp) != 1U ||
         memcmp(header.magic, STATE_MAGIC, sizeof(header.magic)) != 0 ||
         header.version != STATE_VERSION ||
-        header.count > MAX_SAVED_CRTCS ||
-        header.backlight_count > MAX_BACKLIGHTS) {
+        header.count > MAX_JOURNAL_RAMPS ||
+        header.backlight_count > MAX_JOURNAL_BACKLIGHTS) {
         goto bad;
     }
     /*
@@ -1864,16 +1938,24 @@ static int recovery_apply(Display *dpy, Window root, const char *path,
     if (rc != 0) return rc;
 
     if (dpy != NULL) {
-        nlive = enumerate_live_outputs(dpy, root, live, MAX_SAVED_CRTCS);
+        int n = enumerate_live_outputs(dpy, root, live, MAX_SAVED_CRTCS);
+        /*
+         * A failed enumeration leaves nlive at 0, so every record stays
+         * unmatched and is carried forward as pending. That is the safe
+         * outcome: the journal is kept and nothing is applied blindly.
+         */
+        nlive = (n > 0) ? (size_t)n : 0U;
         g_x_error_count = 0;
     }
 
     /*
-     * Match records to outputs strictly one-to-one, strongest evidence first:
-     * an exact EDID match, then a connector-name match, then the CRTC id.
-     * Without the "claimed" bookkeeping, two records could both pick the same
-     * monitor - which is exactly what happens with two identical panels, the
-     * case where getting it wrong is most visible.
+     * Match records to outputs strictly one-to-one, strongest evidence first.
+     *
+     * The pass order matters as much as the one-to-one rule. Two monitors of
+     * the same model report the same EDID hash, so matching on EDID alone
+     * would pair them in array order and could swap their ramps. Requiring
+     * EDID *and* connector first pins the unambiguous pairs; only then is a
+     * weaker key allowed to place whatever is left.
      */
     {
         int claimed[MAX_SAVED_CRTCS];
@@ -1881,41 +1963,47 @@ static int recovery_apply(Display *dpy, Window root, const char *path,
 
         for (l = 0U; l < nlive; ++l) claimed[l] = 0;
 
-        for (pass = 0; pass < 3; ++pass) {
+        for (pass = 0; pass < 4; ++pass) {
             for (i = 0U; i < st->ramp_count; ++i) {
                 StateRamp *ramp = &st->ramps[i];
+                int has_edid = (ramp->edid_hash != 0U);
                 if (ramp->applied) continue;
                 for (l = 0U; l < nlive; ++l) {
+                    int edid_eq, name_eq;
                     int hit = 0;
                     if (claimed[l]) continue;
                     if (live[l].gamma_size != (int)ramp->size) continue;
-                    if (pass == 0) {
-                        hit = (ramp->edid_hash != 0U && live[l].edid_hash != 0U &&
+                    edid_eq = (has_edid && live[l].edid_hash != 0U &&
                                ramp->edid_hash == live[l].edid_hash);
-                    } else if (pass == 1) {
-                        hit = (ramp->output[0] != '\0' && live[l].name[0] != '\0' &&
-                               strcmp(ramp->output, live[l].name) == 0 &&
-                               !(ramp->edid_hash != 0U && live[l].edid_hash != 0U));
-                    } else {
+                    name_eq = (ramp->output[0] != '\0' && live[l].name[0] != '\0' &&
+                               strcmp(ramp->output, live[l].name) == 0);
+                    switch (pass) {
+                    case 0:  /* same panel, same port: unambiguous */
+                        hit = edid_eq && name_eq;
+                        break;
+                    case 1:  /* same panel, moved to another port */
+                        hit = edid_eq;
+                        break;
+                    case 2:  /* same port, and EDID cannot contradict it */
+                        hit = name_eq && !(has_edid && live[l].edid_hash != 0U);
+                        break;
+                    default: /* nothing but the old CRTC id to go on */
                         hit = (ramp->crtc == (uint64_t)live[l].crtc &&
-                               ramp->output[0] == '\0' && ramp->edid_hash == 0U);
+                               ramp->output[0] == '\0' && !has_edid);
+                        break;
                     }
                     if (!hit) continue;
-                    ramp->applied = 1;   /* provisional: cleared below on failure */
-                    claimed[l] = 1;
                     {
                         XRRCrtcGamma *g = XRRAllocGamma((int)ramp->size);
-                        if (g == NULL) {
-                            ramp->applied = 0;
-                            claimed[l] = 0;
-                            break;
-                        }
+                        if (g == NULL) break;   /* leave unmatched; try nothing else */
                         memcpy(g->red, ramp->red, (size_t)ramp->size * sizeof(unsigned short));
                         memcpy(g->green, ramp->green, (size_t)ramp->size * sizeof(unsigned short));
                         memcpy(g->blue, ramp->blue, (size_t)ramp->size * sizeof(unsigned short));
                         XRRSetCrtcGamma(dpy, live[l].crtc, g);
                         XRRFreeGamma(g);
                     }
+                    ramp->applied = 1;
+                    claimed[l] = 1;
                     out->ramps_restored++;
                     break;
                 }
@@ -1952,12 +2040,16 @@ static int recovery_complete(const RecoveryResult *r)
     return r->ramps_unmatched == 0 && r->backlights_failed == 0 && r->x_errors == 0;
 }
 
-static int set_identity_gamma(Display *dpy, Window root)
+/* Returns the number of CRTCs the server actually accepted; *errors_out gets
+ * the number it rejected. */
+static int set_identity_gamma(Display *dpy, Window root, int *errors_out)
 {
     XRRScreenResources *res;
     int i;
     int changed = 0;
 
+    if (errors_out != NULL) *errors_out = 0;
+    g_x_error_count = 0;
     res = XRRGetScreenResourcesCurrent(dpy, root);
     if (res == NULL) return -1;
     for (i = 0; i < res->ncrtc; ++i) {
@@ -1986,7 +2078,11 @@ static int set_identity_gamma(Display *dpy, Window root)
         changed++;
     }
     XRRFreeScreenResources(res);
-    XSync(dpy, False);
+    XSync(dpy, False);   /* only now can the server's verdict be trusted */
+    if (g_x_error_count > 0) {
+        if (errors_out != NULL) *errors_out = g_x_error_count;
+        return changed - g_x_error_count > 0 ? changed - g_x_error_count : 0;
+    }
     return changed;
 }
 
@@ -2043,23 +2139,24 @@ static int apply_color_state(App *app)
     size_t index[MAX_SAVED_CRTCS];
     size_t staged_count = 0U;
     size_t c, k;
-    size_t before;
+    unsigned long before;
     int skipped = 0;
     int rc = 0;
 
-    before = app->crtc_count;
+    before = app->table_generation;
     if (crtc_table_sync(app) < 0) {
         app_warn(app, "the RandR topology could not be read; nothing was applied");
         return -1;
     }
     /*
-     * The sync may have adopted an output that appeared between the last
-     * journal write and now. Its pristine ramp must be on disk before a tint
-     * goes on top of it, or a crash in between would make that tint the new
-     * "original".
+     * The sync may have adopted, replaced or dropped an output since the last
+     * journal write. Any pristine ramp must be on disk before a tint goes on
+     * top of it, or a crash in between would make that tint the new
+     * "original". The generation counter catches a same-count swap, which a
+     * count comparison would miss entirely.
      */
-    if (app->crtc_count != before && save_recovery_file(app) != 0) {
-        app_warn(app, "a new output could not be journalled; nothing was applied");
+    if (app->table_generation != before && save_recovery_file(app) != 0) {
+        app_warn(app, "the new output set could not be journalled; nothing was applied");
         return -1;
     }
 
@@ -2125,13 +2222,22 @@ static int apply_color_state(App *app)
      */
     if (g_x_error_count > 0) {
         int errors = g_x_error_count;
+        g_x_error_count = 0;
         for (k = 0U; k < staged_count; ++k) {
             XRRCrtcGamma *base = app->crtcs[index[k]].original;
             if (base != NULL) XRRSetCrtcGamma(app->dpy, app->crtcs[index[k]].id, base);
         }
         XSync(app->dpy, False);
-        app_warn(app, "the X server rejected %d gamma request(s); the batch was rolled back",
-                 errors);
+        if (g_x_error_count > 0) {
+            /* The rollback itself was refused: the screen may be left in the
+             * rejected state, and only an explicit reset can fix that. */
+            app_warn(app, "the X server rejected %d gamma request(s) AND %d of the rollback; "
+                          "run 'normal', or 'emergency-reset' if the screen looks wrong",
+                     errors, g_x_error_count);
+        } else {
+            app_warn(app, "the X server rejected %d gamma request(s); the batch was rolled back",
+                     errors);
+        }
         rc = -1;
     }
 
@@ -2255,8 +2361,20 @@ static int xio_error_handler(Display *dpy)
 {
     (void)dpy;
     if (g_app != NULL) {
-        restore_backlights(g_app);
+        int failed = restore_backlights(g_app);
         (void)unlink(g_app->socket_path);
+        /*
+         * The saved gamma ramps describe a server that no longer exists, and
+         * the backlights have just been put back. Leaving the journal behind
+         * would let a later run replay stale levels over whatever the user
+         * has since set. Keep it only while something is still owed.
+         */
+        if (failed == 0 && g_app->pending_count == 0U && g_app->pending_bl_count == 0U) {
+            (void)unlink(g_app->recovery_path);
+        } else {
+            g_app->crtc_count = 0U;   /* ramps are meaningless without the server */
+            (void)save_recovery_file(g_app);
+        }
     }
     _exit(EXIT_RUNTIME);
 }
@@ -2330,18 +2448,45 @@ static int set_backlight_percent(App *app, double percent, const char *device,
      * undo their change rather than ours.
      */
     if (!bl->changed) {
-        long current;
-        long current_max;
-        char max_path[PATH_MAX];
-        char device_dir[PATH_MAX];
+        size_t pi;
+        int inherited = 0;
 
-        if (snprintf(device_dir, sizeof(device_dir), "%s/%s", g_backlight_root, bl->name) > 0 &&
-            path_join(max_path, sizeof(max_path), device_dir, "max_brightness") == 0 &&
-            read_long_file(max_path, &current_max) == 0 && current_max > 0) {
-            bl->maximum = current_max;
+        /*
+         * A level still owed by a previous instance outranks whatever is on
+         * the device right now: it is the value from before PhosTint ever
+         * touched this backlight. Adopting it (and taking the debt over)
+         * keeps that oldest original alive even if the user moved the
+         * brightness in the meantime.
+         */
+        for (pi = 0U; pi < app->pending_bl_count; ++pi) {
+            if (strcmp(app->pending_bl[pi].name, bl->name) != 0) continue;
+            if (app->pending_bl[pi].original > (uint64_t)LONG_MAX ||
+                app->pending_bl[pi].maximum > (uint64_t)LONG_MAX) break;
+            if ((long)app->pending_bl[pi].maximum == bl->maximum) {
+                bl->original = (long)app->pending_bl[pi].original;
+                inherited = 1;
+            }
+            memmove(&app->pending_bl[pi], &app->pending_bl[pi + 1U],
+                    (app->pending_bl_count - pi - 1U) * sizeof(app->pending_bl[0]));
+            app->pending_bl_count--;
+            break;
         }
-        if (read_long_file(bl->brightness_path, &current) == 0 && current >= 0) {
-            bl->original = current;
+
+        if (!inherited) {
+            long current;
+            long current_max;
+            char max_path[PATH_MAX];
+            char device_dir[PATH_MAX];
+
+            if (snprintf(device_dir, sizeof(device_dir), "%s/%s",
+                         g_backlight_root, bl->name) > 0 &&
+                path_join(max_path, sizeof(max_path), device_dir, "max_brightness") == 0 &&
+                read_long_file(max_path, &current_max) == 0 && current_max > 0) {
+                bl->maximum = current_max;
+            }
+            if (read_long_file(bl->brightness_path, &current) == 0 && current >= 0) {
+                bl->original = current;
+            }
         }
     }
 
@@ -2538,7 +2683,8 @@ static void status_text(App *app, char *response, size_t response_size)
                "mode=%s brightness=%.0f%% strength=%.0f%% rgb=%.0f/%.0f/%.0f%% "
                "blue_limit=%.0f%% noise=%d%% kelvin=%.0f backlight=%.0f%% "
                "active_crtcs=%zu managed_crtcs=%zu pending_ramps=%zu "
-               "backlights=%zu writable_backlights=%d changed_backlights=%d",
+               "backlights=%zu writable_backlights=%d changed_backlights=%d "
+               "pending_backlights=%zu",
                app->state.mode,
                app->state.brightness * 100.0,
                app->state.strength * 100.0,
@@ -2554,7 +2700,8 @@ static void status_text(App *app, char *response, size_t response_size)
                app->pending_count,
                app->backlight_count,
                writable,
-               changed);
+               changed,
+               app->pending_bl_count);
 
     buf_append(response, response_size, &used, " outputs=");
     if (app->crtc_count == 0U) {
@@ -2742,11 +2889,21 @@ static int commit_look(App *app, int target)
  */
 static int commit_or_rollback(App *app, int target, const LookSnapshot *snap)
 {
+    char first_failure[sizeof(app->last_warning)];
+
     if (commit_look(app, target) == 0) return 0;
+
+    (void)snprintf(first_failure, sizeof(first_failure), "%s", app->last_warning);
     look_restore(app, snap);
-    /* Best effort: if this also fails the warning from the first failure is
-     * kept, and the ramps are already back at their pristine values. */
-    (void)apply_color_state(app);
+    if (apply_color_state(app) != 0) {
+        /* Both the change and the undo failed: the screen is sitting on the
+         * pristine ramps while the user expected their previous look. Report
+         * both problems rather than only the first. */
+        app_warn(app, "%s; restoring the previous look also failed, "
+                      "the outputs are at their captured ramps", first_failure);
+    } else {
+        app_warn(app, "%s", first_failure);
+    }
     return -1;
 }
 
@@ -3258,6 +3415,11 @@ static const char *daemon_error_text(const char *code)
         return "could not detach the daemon process";
     if (strncmp(code, "Epaths", 6U) == 0)
         return "could not prepare the private runtime directory";
+    if (strncmp(code, "ECorrupt", 8U) == 0)
+        return "the recovery journal is unreadable, so the current ramps cannot be trusted as "
+               "the baseline. Either reset to a neutral ramp with "
+               "'emergency-reset --identity', or accept what is on screen now with "
+               "'start --accept-current'";
     return "the daemon failed to initialize";
 }
 
@@ -3325,6 +3487,7 @@ typedef struct {
     char out[MAX_RESPONSE + 8];   /* reply still to be flushed */
     size_t out_len;
     size_t out_sent;
+    int draining;                 /* discard the rest of an over-long command */
     uint64_t deadline_ms;
 } Client;
 
@@ -3335,6 +3498,7 @@ static void client_close(Client *c)
     c->used = 0U;
     c->out_len = 0U;
     c->out_sent = 0U;
+    c->draining = 0;
 }
 
 /*
@@ -3392,8 +3556,32 @@ static int client_service(App *app, Client *c)
 {
     char response[MAX_RESPONSE];
     int complete = 0;
+    int oversized = 0;
     int wn;
     int result;
+
+    /*
+     * Swallow the tail of a rejected over-long command before answering.
+     * Closing the socket with unread data in flight makes the kernel send
+     * RST, and the client would see "connection reset" instead of the
+     * explanation it needs.
+     */
+    if (c->draining) {
+        char sink[512];
+        for (;;) {
+            ssize_t n = read(c->fd, sink, sizeof(sink));
+            if (n > 0) continue;
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+            break;   /* EOF or error: the peer has finished */
+        }
+        c->draining = 0;
+        if (client_flush(c)) {
+            client_close(c);
+            return 1;
+        }
+        return 0;
+    }
 
     /* A reply already in flight just needs more room in the socket. */
     if (c->out_len > 0U) {
@@ -3421,7 +3609,14 @@ static int client_service(App *app, Client *c)
             complete = 1;
             break;
         }
-        if (c->used + 1U >= sizeof(c->buf)) {   /* oversized: answer and drop */
+        if (c->used + 1U >= sizeof(c->buf)) {
+            /*
+             * Refuse an over-long command outright. Executing the truncated
+             * prefix would be far worse than an error: "brightness 100000..."
+             * cut short becomes a perfectly valid, completely different
+             * command.
+             */
+            oversized = 1;
             complete = 1;
             break;
         }
@@ -3429,7 +3624,14 @@ static int client_service(App *app, Client *c)
     if (!complete) return 0;
 
     c->buf[c->used] = '\0';
-    result = handle_command(app, c->buf, response, sizeof(response));
+    if (oversized) {
+        (void)snprintf(response, sizeof(response),
+                       "Command longer than %d bytes was refused (never truncated).",
+                       (int)sizeof(c->buf) - 1);
+        result = -1;
+    } else {
+        result = handle_command(app, c->buf, response, sizeof(response));
+    }
     wn = snprintf(c->out, sizeof(c->out), "%s %s\n", result == 0 ? "OK" : "ERR", response);
     if (wn <= 0 || (size_t)wn >= sizeof(c->out)) {
         client_close(c);
@@ -3437,6 +3639,10 @@ static int client_service(App *app, Client *c)
     }
     c->out_len = (size_t)wn;
     c->out_sent = 0U;
+    if (oversized) {
+        c->draining = 1;   /* answer only after the peer stops writing */
+        return 0;
+    }
     if (client_flush(c)) {
         client_close(c);
         return 1;
@@ -3446,7 +3652,7 @@ static int client_service(App *app, Client *c)
     return 0;
 }
 
-static int daemon_loop(int notify_fd)
+static int daemon_loop(int notify_fd, int accept_baseline)
 {
     App app;
     int server_fd = -1;
@@ -3513,31 +3719,50 @@ static int daemon_loop(int notify_fd)
 
         if (rc < 0) {
             /*
-             * A journal exists but cannot be parsed. Whatever the previous
-             * instance did is unknown, so the ramps we are about to capture
-             * as "original" may already be tinted. Keep the file for
-             * inspection instead of deleting evidence, and tell the user
-             * plainly - this is the one situation the program cannot undo by
-             * itself.
+             * A journal exists but cannot be read or parsed. Whatever the
+             * previous instance did is unknown, so the ramps on screen right
+             * now may already be tinted - capturing them as "original" would
+             * silently make a tint permanent.
+             *
+             * Fail closed: preserve the file (never delete the only evidence)
+             * and refuse to start. The user decides explicitly whether to
+             * trust the current ramps or to reset to a neutral baseline.
              */
             char keep[PATH_MAX];
             int n = snprintf(keep, sizeof(keep), "%s.corrupt", app.recovery_path);
-            if (n > 0 && (size_t)n < sizeof(keep) && rename(app.recovery_path, keep) != 0) {
-                (void)unlink(app.recovery_path);
+            if (n > 0 && (size_t)n < sizeof(keep)) {
+                (void)rename(app.recovery_path, keep);  /* on failure: leave it in place */
+            }
+            if (!accept_baseline) {
+                daemon_report(notify_fd, "ECorrupt\n");
+                XCloseDisplay(app.dpy);
+                return EXIT_RUNTIME;
             }
             (void)snprintf(app.sticky_warning, sizeof(app.sticky_warning), "%s",
-                           "the previous recovery journal was unreadable, so the captured "
-                           "baseline may already be tinted; run 'emergency-reset --identity' "
-                           "if the screen looks wrong");
+                           "started with --accept-current after an unreadable journal: the "
+                           "captured baseline is whatever was on screen, which may already "
+                           "be tinted");
         } else if (rc == 0) {
             size_t k;
+            size_t dropped = 0U;
             for (k = 0U; k < st.ramp_count; ++k) {
-                if (!st.ramps[k].applied) (void)pending_take(&app, &st.ramps[k]);
+                if (st.ramps[k].applied) continue;
+                if (pending_take(&app, &st.ramps[k]) != 0) dropped++;
             }
-            for (k = 0U; k < st.backlight_count &&
-                         app.pending_bl_count < MAX_BACKLIGHTS; ++k) {
+            for (k = 0U; k < st.backlight_count; ++k) {
                 if (st.backlight_applied[k]) continue;
+                if (app.pending_bl_count >= MAX_BACKLIGHTS) {
+                    dropped++;
+                    continue;
+                }
                 app.pending_bl[app.pending_bl_count++] = st.backlights[k];
+            }
+            if (dropped > 0U) {
+                /* Only reachable with a hand-crafted journal, but losing
+                 * recovery data is never something to pass over in silence. */
+                (void)snprintf(app.sticky_warning, sizeof(app.sticky_warning),
+                               "%zu recovery record(s) from the journal exceeded the in-memory "
+                               "limits and were dropped", dropped);
             }
             if (rr.x_errors > 0) {
                 app_warn(&app, "the X server rejected %d recovery request(s)", rr.x_errors);
@@ -3632,7 +3857,8 @@ static int daemon_loop(int notify_fd)
             if (clients[ci].fd < 0) continue;
             map[nfds - 2U] = ci;
             pfd[nfds].fd = clients[ci].fd;
-            pfd[nfds].events = clients[ci].out_len > 0U ? POLLOUT : POLLIN;
+            pfd[nfds].events = (clients[ci].out_len > 0U && !clients[ci].draining)
+                                   ? POLLOUT : POLLIN;
             pfd[nfds].revents = 0;
             timeout_ms = deadline_delta(clients[ci].deadline_ms, now, timeout_ms);
             nfds++;
@@ -3693,7 +3919,8 @@ static int daemon_loop(int notify_fd)
     return clean_restore ? EXIT_OK : EXIT_RUNTIME;
 }
 
-static int start_daemon(const char *socket_path, char *err, size_t err_size)
+static int start_daemon(const char *socket_path, char *err, size_t err_size,
+                        int accept_baseline)
 {
     int test_fd;
     int pipefd[2];
@@ -3751,7 +3978,7 @@ static int start_daemon(const char *socket_path, char *err, size_t err_size)
         if (chdir("/") != 0) {
             /* Not fatal: the daemon only uses absolute paths anyway. */
         }
-        _exit(daemon_loop(pipefd[1]));
+        _exit(daemon_loop(pipefd[1], accept_baseline));
     }
 
     close(pipefd[1]);
@@ -4156,7 +4383,7 @@ static void tui_send(const char *socket_path, const char *cmd, char *msg, size_t
     if (send_daemon_command(socket_path, cmd, resp, sizeof(resp)) != 0) {
         /* The daemon may have been stopped externally: restart it once. */
         char err[256];
-        if (start_daemon(socket_path, err, sizeof(err)) != 0 ||
+        if (start_daemon(socket_path, err, sizeof(err), 0) != 0 ||
             send_daemon_command(socket_path, cmd, resp, sizeof(resp)) != 0) {
             (void)snprintf(msg, msg_size, "%s", "Could not reach the daemon.");
             return;
@@ -4400,7 +4627,7 @@ static int run_tui(const char *socket_path)
                 "The TUI needs an interactive terminal ('phostint interactive' is the plain menu).\n");
         return EXIT_USAGE;
     }
-    if (start_daemon(socket_path, err, sizeof(err)) != 0) {
+    if (start_daemon(socket_path, err, sizeof(err), 0) != 0) {
         fprintf(stderr, "Could not start the PhosTint daemon: %s.\n", err);
         return EXIT_RUNTIME;
     }
@@ -4853,6 +5080,41 @@ static int run_selftest(void)
             (void)unlink(path);
             check(&failures, state_load(path, &st) == 1, "a missing journal is not an error");
             state_free(&st);
+
+            /*
+             * A journal that exists but cannot be opened must never look like
+             * "no journal": that difference decides whether the baseline can
+             * be trusted.
+             */
+            {
+                FILE *f = fopen(path, "wb");
+                if (f != NULL) {
+                    (void)fwrite(&h, sizeof(h), 1U, f);
+                    (void)fclose(f);
+                }
+                if (chmod(path, 0) == 0 && access(path, R_OK) != 0) {
+                    check(&failures, state_load(path, &st) == -1,
+                          "an unreadable journal is an error, not an absence");
+                    state_free(&st);
+                } else {
+                    puts("skip unreadable-journal test (running with override permissions)");
+                }
+                (void)chmod(path, S_IRUSR | S_IWUSR);
+                (void)unlink(path);
+            }
+            {
+                char link_path[sizeof(path) + 8];
+                (void)snprintf(link_path, sizeof(link_path), "%s.link", path);
+                (void)unlink(link_path);
+                if (symlink("/etc/hostname", link_path) == 0) {
+                    check(&failures, state_load(link_path, &st) == -1,
+                          "a symlink in place of the journal is an error, not an absence");
+                    state_free(&st);
+                    (void)unlink(link_path);
+                } else {
+                    puts("skip symlink-journal test (symlink not permitted here)");
+                }
+            }
 #undef WRITE_GOOD_STATE
         }
     }
@@ -4923,6 +5185,22 @@ static int run_selftest(void)
           "\"a\" matches the published FNV-1a 64-bit vector");
     check(&failures, fnv1a64("foobar", 6U) == 9625390261332436968ULL,
           "\"foobar\" matches the published FNV-1a 64-bit vector");
+
+    /* ---- the journal can hold everything the program can hold ---- */
+    check(&failures, MAX_JOURNAL_RAMPS >= MAX_SAVED_CRTCS * 2,
+          "journal ramp capacity covers live outputs plus pending ones");
+    check(&failures, MAX_JOURNAL_BACKLIGHTS >= MAX_BACKLIGHTS * 2,
+          "journal backlight capacity covers changed plus pending devices");
+    {
+        /* The writer's worst case must stay inside what the loader accepts,
+         * otherwise the fail-closed branch would be reachable in normal use. */
+        size_t worst_ramps = (size_t)MAX_SAVED_CRTCS + (size_t)MAX_SAVED_CRTCS;
+        size_t worst_bl = (size_t)MAX_BACKLIGHTS + (size_t)MAX_BACKLIGHTS;
+        check(&failures, worst_ramps <= MAX_JOURNAL_RAMPS,
+              "a full table plus a full pending list still fits the journal");
+        check(&failures, worst_bl <= MAX_JOURNAL_BACKLIGHTS,
+              "every backlight record still fits the journal");
+    }
 
     /* ---- identical monitors need one-to-one matching, not just EDID ---- */
     {
@@ -5059,32 +5337,70 @@ static int run_selftest(void)
                       "a matching scale restores the exact level");
             }
 
+            /*
+             * A level still owed by a crashed instance must survive the user
+             * moving the brightness by hand: the debt is older, and it is the
+             * value from before PhosTint first touched the device.
+             */
+            {
+                char p[PATH_MAX];
+                a.backlights[0].changed = 0;
+                a.backlights[1].changed = 0;
+                a.pending_bl_count = 1U;
+                memset(&a.pending_bl[0], 0, sizeof(a.pending_bl[0]));
+                (void)snprintf(a.pending_bl[0].name, sizeof(a.pending_bl[0].name),
+                               "%s", "aa_firmware");
+                a.pending_bl[0].original = 77U;      /* the true pre-PhosTint level */
+                a.pending_bl[0].maximum = 100U;
+                (void)snprintf(p, sizeof(p), "%s/aa_firmware/brightness", root);
+                (void)write_long_file(p, 12L);       /* user moved it meanwhile */
+                (void)snprintf(a.recovery_path, sizeof(a.recovery_path), "%s/journal2", root);
+
+                check(&failures,
+                      set_backlight_percent(&a, 90.0, "aa_firmware", resp, sizeof(resp)) == 0,
+                      "a device with an owed level can still be driven");
+                check(&failures, find_backlight(&a, "aa_firmware")->original == 77L,
+                      "the owed original wins over the level the user set meanwhile");
+                check(&failures, a.pending_bl_count == 0U,
+                      "the debt moved from the pending list to the live device");
+                check(&failures, restore_backlights(&a) == 0 &&
+                      read_long_file(p, &v) == 0 && v == 77L,
+                      "restoring puts back the oldest original, not the interim value");
+                (void)unlink(a.recovery_path);
+            }
+
             /* Refuse to touch hardware when the journal cannot be written. */
             {
+                char p[PATH_MAX];
+                long before = -1L;
+
                 (void)unlink(a.recovery_path);
                 (void)snprintf(a.recovery_path, sizeof(a.recovery_path),
                                "%s/missing-dir/journal", root);
                 a.backlights[0].changed = 0;
                 a.backlights[1].changed = 0;
+                a.pending_bl_count = 0U;
+                (void)snprintf(p, sizeof(p), "%s/aa_firmware/brightness", root);
+                (void)read_long_file(p, &before);
                 check(&failures,
                       set_backlight_percent(&a, 25.0, "aa_firmware", resp, sizeof(resp)) != 0,
                       "an unwritable journal blocks the backlight change");
-                {
-                    char p[PATH_MAX];
-                    (void)snprintf(p, sizeof(p), "%s/aa_firmware/brightness", root);
-                    (void)read_long_file(p, &v);
-                    check(&failures, v == 40L, "and the hardware was not touched");
-                }
+                (void)read_long_file(p, &v);
+                check(&failures, before > 0L && v == before,
+                      "and the hardware was not touched");
             }
 
             g_backlight_root = saved_root;
             {
+                /* Leave nothing behind in the user's runtime directory. */
                 char cleanup[256];
                 (void)snprintf(cleanup, sizeof(cleanup), "%s/aa_firmware", root);
                 (void)unlink_tree(cleanup);
                 (void)snprintf(cleanup, sizeof(cleanup), "%s/zz_raw", root);
                 (void)unlink_tree(cleanup);
-                (void)rmdir(root);
+                if (unlink_tree(root) != 0) {
+                    printf("note: could not remove the temporary test tree %s\n", root);
+                }
             }
 #undef MAKE_DEV
         }
@@ -5227,8 +5543,9 @@ static void print_help(const char *argv0)
     printf("  * 'normal' restores the exact gamma ramps captured at daemon startup.\n");
     printf("  * Monitor hotplug and mode changes re-apply the current look automatically;\n");
     printf("    a monitor keeps its own look and its own pristine ramp across replugs.\n");
-    printf("  * 'backlight' drives one device (raw is preferred over firmware); 'list' marks\n");
-    printf("    the default target with '*' and shows every device name.\n");
+    printf("  * 'backlight' drives exactly one device. The default follows the kernel's own\n");
+    printf("    preference (firmware, then platform, then raw); 'list' marks it with '*'\n");
+    printf("    and shows every device name, so you can target another one by name.\n");
     printf("  * Do not run redshift/gammastep/night-light tools at the same time.\n");
     printf("  * i3wm autostart: exec --no-startup-id %s start\n", argv0);
     printf("  * Digital color control cannot guarantee identical physical (spectral) output.\n");
@@ -5258,7 +5575,8 @@ static void print_response(const char *response)
     }
 }
 
-static int emergency_reset(const char *socket_path, const char *recovery_path, int allow_identity)
+static int emergency_reset(const char *socket_path, const char *recovery_path,
+                           int allow_identity, int runtime_is_volatile)
 {
     Display *dpy;
     Window root = None;
@@ -5267,6 +5585,7 @@ static int emergency_reset(const char *socket_path, const char *recovery_path, i
     RecoveryResult rr;
     int rc;
     int identity = 0;
+    int identity_errors = 0;
 
     /*
      * A healthy daemon is the best recovery path: it still holds the exact
@@ -5287,7 +5606,9 @@ static int emergency_reset(const char *socket_path, const char *recovery_path, i
         fprintf(stderr, "Warning: cannot open the X11 display; trying backlight-only recovery.\n");
     }
 
-    rc = recovery_apply(dpy, root, recovery_path, &st, &rr, 0);
+    /* Same boot-stamp policy as the daemon, or the two would disagree about
+     * whether the very same file is usable. */
+    rc = recovery_apply(dpy, root, recovery_path, &st, &rr, runtime_is_volatile);
     if (rc < 0) {
         fprintf(stderr, "The recovery journal is unusable (corrupt, or from a previous boot);"
                         " it was not applied.\n");
@@ -5327,8 +5648,13 @@ static int emergency_reset(const char *socket_path, const char *recovery_path, i
         return EXIT_RUNTIME;
     }
     if (dpy != NULL) {
-        identity = set_identity_gamma(dpy, root);
+        identity = set_identity_gamma(dpy, root, &identity_errors);
         XCloseDisplay(dpy);
+    }
+    if (identity_errors > 0) {
+        fprintf(stderr, "The X server rejected %d of the identity requests; "
+                        "%d output(s) were reset.\n", identity_errors, identity);
+        return EXIT_RUNTIME;
     }
     if (identity > 0) {
         printf("Set %d active CRTC(s) to identity gamma at your explicit request.\n", identity);
@@ -5361,7 +5687,7 @@ static int run_interactive(const char *socket_path)
     char response[MAX_RESPONSE];
     char err[256];
 
-    if (start_daemon(socket_path, err, sizeof(err)) != 0) {
+    if (start_daemon(socket_path, err, sizeof(err), 0) != 0) {
         fprintf(stderr, "Could not start the PhosTint daemon: %s.\n", err);
         return EXIT_RUNTIME;
     }
@@ -5477,14 +5803,16 @@ int main(int argc, char **argv)
     char command[MAX_COMMAND];
     char response[MAX_RESPONSE];
     char err[256];
+    int runtime_volatile = 0;
+    int accept_baseline = 0;
     int rc;
 
     /* A peer disappearing during IPC must become an error, never SIGPIPE. */
     (void)signal(SIGPIPE, SIG_IGN);
 
-    if (make_runtime_paths(socket_path, sizeof(socket_path),
-                           recovery_path, sizeof(recovery_path),
-                           lock_path, sizeof(lock_path)) != 0) {
+    if (make_runtime_paths_ex(socket_path, sizeof(socket_path),
+                              recovery_path, sizeof(recovery_path),
+                              lock_path, sizeof(lock_path), &runtime_volatile) != 0) {
         fprintf(stderr, "Could not create runtime paths.\n");
         return EXIT_RUNTIME;
     }
@@ -5492,6 +5820,15 @@ int main(int argc, char **argv)
     if (argc < 2) {
         print_help(argv[0]);
         return EXIT_OK;
+    }
+    /*
+     * Opt in to trusting the ramps currently on screen as the baseline. Only
+     * meaningful after an unreadable journal, which is the one case where the
+     * daemon refuses to guess.
+     */
+    if (argc >= 3 && strcmp(argv[argc - 1], "--accept-current") == 0) {
+        accept_baseline = 1;
+        argc--;
     }
     if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "help") == 0) {
         print_help(argv[0]);
@@ -5516,10 +5853,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "Usage: %s emergency-reset [--identity]\n", argv[0]);
             return EXIT_USAGE;
         }
-        return emergency_reset(socket_path, recovery_path, allow_identity);
+        return emergency_reset(socket_path, recovery_path, allow_identity, runtime_volatile);
     }
     if (strcmp(argv[1], "foreground") == 0) {
-        return daemon_loop(-1);
+        return daemon_loop(-1, accept_baseline);
     }
     if (strcmp(argv[1], "tui") == 0) {
         return run_tui(socket_path);
@@ -5528,7 +5865,7 @@ int main(int argc, char **argv)
         return run_interactive(socket_path);
     }
     if (strcmp(argv[1], "start") == 0) {
-        if (start_daemon(socket_path, err, sizeof(err)) != 0) {
+        if (start_daemon(socket_path, err, sizeof(err), accept_baseline) != 0) {
             fprintf(stderr, "Could not start PhosTint: %s.\n", err);
             return EXIT_RUNTIME;
         }
@@ -5555,7 +5892,7 @@ int main(int argc, char **argv)
     }
 
     /* User-friendly behavior: mutation commands auto-start the daemon. */
-    if (start_daemon(socket_path, err, sizeof(err)) != 0) {
+    if (start_daemon(socket_path, err, sizeof(err), accept_baseline) != 0) {
         fprintf(stderr, "Could not start PhosTint: %s.\n", err);
         return EXIT_RUNTIME;
     }
